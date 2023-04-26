@@ -1,13 +1,9 @@
-import asyncio
 import requests
-import json
 import time
-import websockets
 from string import Template
-#from websockets.sync.client import connect
 from prometheus_client.parser import text_string_to_metric_families
 
- #Global Variables
+#Global Variables
 myApiAuthToken = '%th1s-IS-a-S3CR3T-ap1-PUSHING-b1ts-TO-you%'
 APIurlbase = Template('http://localhost:$APIport/api/v2/') 
 websocketAPIbaseurl = Template('ws://localhost:$APIport/api/v2/messages/websocket?apiToken=$AuthToken')
@@ -46,13 +42,6 @@ def HTTPpostRequest(url, headers, data):
     response.raise_for_status()
     return response
 
-def connectWebSocket(node):
-    nodeAPIPort = APIPorts['node5']
-    while True:
-        with websockets.connect(websocketAPIbaseurl.substitute(APIport=nodeAPIPort, AuthToken=myApiAuthToken)) as websocket:
-            message = websocket.recv()
-        #print(f"Received: {message}")
-
 #Prints
 def printResponseJson(jsonObject):
     print(json.dumps(jsonObject, indent=2))
@@ -67,7 +56,7 @@ def getNodeMetrics(nodeAPIPort):
     url = APIurlbase.substitute(APIport=nodeAPIPort) + 'node/metrics'
     headers = {'accept': 'application/json',
                'x-auth-token': myApiAuthToken}
-    response = requests.get(url, headers=headers) #because response is plain text
+    response = requests.get(url, headers=headers)
     response.raise_for_status()
 
     metrics = response.content.decode('UTF-8')
@@ -106,11 +95,17 @@ def sendMessage(senderNode, receiverNode, message, path, hops):
             'path' : path,
             'hops': hops}
     response = HTTPpostRequest(url, headers, data)
-    time.sleep(0.25)
+    time.sleep(0.25) #Leave time for catching
     return response
 
-#Setup Tests
-def testChannelsForAllNodes():
+def init():
+    #wait = input('Start the docker cluster by with     docker run --rm -d -p 8545:8545 -p 13301-13305:13301-13305 -p 18081-18085:18081-18085 -p 19091-19095:19091-19095 -p 19501-19505:19501-19505 --name pluto_cluster gcr.io/hoprassociation/hopr-pluto:1.92.7  and Press Enter to start the tests./n')
+
+    nodeHOPRAddresses = getNodeAddresses()
+    print('Node HOPR addresses:')
+    printDict(nodeHOPRAddresses) #not necessary for final run
+
+def test_channelsForAllNodes():
     for node, APIPort in APIPorts.items():
         includingClosed='false'
         url = APIurlbase.substitute(APIport=APIPort) + 'channels/?includingClosed=' + includingClosed
@@ -120,11 +115,10 @@ def testChannelsForAllNodes():
         response = HTTPgetRequest(url, headers)
         responseJson = response.json()
 
-        assert len(responseJson['incoming']) == (len(APIPorts)-1), node + 'is does not have an "incoming" channel from every node'
-        assert len(responseJson['outgoing']) == (len(APIPorts)-1), node + 'is does not have an "outgoing" channel to every node'
-    print('Incoming and outgoing channels - OK\n')
+        assert len(responseJson['incoming']) == (len(APIPorts)-1), node + ' does not have an incoming channel from every node'
+        assert len(responseJson['outgoing']) == (len(APIPorts)-1), node + ' does not have an outgoing channel to every node'
 
-def pingNodes():
+def test_pingNodes():
     for node, APIPort in APIPorts.items():
         for HOPRaddress in nodeHOPRAddresses.values():
             if HOPRaddress == nodeHOPRAddresses[node]:
@@ -135,52 +129,38 @@ def pingNodes():
                     'x-auth-token': myApiAuthToken,
                     'Content-Type': 'application/json'}
             response = HTTPpostRequest(url, headers, data)
-    print('All node pinged from all nodes - OK')
 
-#TestCases
-def test_sendMessage(senderNode, receiverNode, message, path, hops):
-    senderMetricsBefore = getRelevantMetricsFor(senderNode)
-    receiverMetricsBefore = getRelevantMetricsFor(receiverNode)
+def test_1():
 
-    #asyncio.get_event_loop().run_until_complete(connectWebSocket(receiverNode))
-    connectWebSocket(receiverNode)
-
-    #sign message
-
-    sendMessage(senderNode, receiverNode, message, path, hops)
-
-    senderMetricsAfter = getRelevantMetricsFor(senderNode)
-    receiverMetricsAfter = getRelevantMetricsFor(receiverNode)
-
-    assert receiverMetricsBefore['core_counter_received_messages_total'] == receiverMetricsAfter['core_counter_received_messages_total']-1 , 'Message was not received'
-
-    #Received Checker 2 - WebSocket
-
-    #Send Check
-        #With Metrics
-        #With response
-
-    # Check tickets received for relaying - ???
-
-
-def main():
-
-    #wait = input('Start the docker cluster by with     docker run --rm -d -p 8545:8545 -p 13301-13305:13301-13305 -p 18081-18085:18081-18085 -p 19091-19095:19091-19095 -p 19501-19505:19501-19505 --name pluto_cluster gcr.io/hoprassociation/hopr-pluto:1.92.7  and Press Enter to start the tests./n')
-
-    nodeHOPRAddresses = getNodeAddresses()
-    print('Node HOPR addresses:')
-    printDict(nodeHOPRAddresses)
-
-    pingNodes()
-
-    testChannelsForAllNodes()
+    init()
 
     senderNode = 'node1'
     receiverNode = 'node5'
     message = "This is the message."
     path = []
     hops = 1
-    test_sendMessage(senderNode, receiverNode, message, path, hops)
 
-if __name__ == "__main__":
-    main()
+    senderMetricsBefore = getRelevantMetricsFor(senderNode)
+    receiverMetricsBefore = getRelevantMetricsFor(receiverNode)
+
+    #sign message
+
+    response = sendMessage(senderNode, receiverNode, message, path, hops)
+
+    assert response.status_code == 202
+
+    senderMetricsAfter = getRelevantMetricsFor(senderNode)
+    receiverMetricsAfter = getRelevantMetricsFor(receiverNode)
+
+    #Send Check
+    assert senderMetricsBefore['core_counter_sent_messages_total'] == senderMetricsAfter['core_counter_sent_messages_total']-1 , 'Message was not sent'
+        #With response
+
+    assert receiverMetricsBefore['core_counter_received_messages_total'] == receiverMetricsAfter['core_counter_received_messages_total']-1 , 'Message was not received'
+
+    #Received Checker 2 - WebSocket
+
+   
+
+    # Check tickets received for relaying - ???
+
