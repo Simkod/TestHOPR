@@ -1,12 +1,14 @@
+import asyncio
+import pytest
 import requests
-import time
+import websockets
+
 from string import Template
 from prometheus_client.parser import text_string_to_metric_families
 
 #Global Variables
 myApiAuthToken = '%th1s-IS-a-S3CR3T-ap1-PUSHING-b1ts-TO-you%'
 APIurlbase = Template('http://localhost:$APIport/api/v2/') 
-websocketAPIbaseurl = Template('ws://localhost:$APIport/api/v2/messages/websocket?apiToken=$AuthToken')
 
 APIPorts = {'node1': 13301,
             'node2': 13302,
@@ -14,24 +16,11 @@ APIPorts = {'node1': 13301,
             'node4': 13304,
             'node5': 13305}
 
-relevantMetricKeys = ['connect_counter_client_relayed_packets_total',
-                    'connect_counter_direct_packets_total',
-                    'connect_counter_server_relayed_packets_total',
-                    'core_counter_forwarded_messages_total',
-                    'core_counter_packets_total',
-                    'core_counter_received_messages_total',
-                    'core_counter_received_successful_acks_total',
-                    'core_counter_sent_acks_total',
-                    'core_counter_sent_messages_total',
-                    'core_ethereum_counter_indexer_announcements_total',
-                    'core_ethereum_counter_num_send_transactions_total',
-                    'core_gauge_num_incoming_channels',
-                    'core_gauge_num_outgoing_channels',
-                    'core_histogram_path_length_bucket']
+relevantMetricKeys = ['core_counter_forwarded_messages_total',
+                      'core_counter_received_messages_total',
+                      'core_counter_sent_messages_total',
+                      ]
 
-nodeHOPRAddresses = {}
-
-#Functions for communication
 def HTTPgetRequest(url, headers):
     response = requests.get(url, headers=headers)
     response.raise_for_status()
@@ -42,29 +31,19 @@ def HTTPpostRequest(url, headers, data):
     response.raise_for_status()
     return response
 
-#Prints
-def printResponseJson(jsonObject):
-    print(json.dumps(jsonObject, indent=2))
-
-def printDict(dict):
-    for key, value in dict.items():
-        print(key, ':', value)
-    print('\n')
-
 #utilties
-def getNodeMetrics(nodeAPIPort):
-    url = APIurlbase.substitute(APIport=nodeAPIPort) + 'node/metrics'
+def getNodeMetrics(node):
+    url = APIurlbase.substitute(APIport=APIPorts[node]) + 'node/metrics'
     headers = {'accept': 'application/json',
                'x-auth-token': myApiAuthToken}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
+    response = HTTPgetRequest(url, headers)
 
     metrics = response.content.decode('UTF-8')
     metrics = text_string_to_metric_families(metrics)
     return metrics
 
 def getRelevantMetricsFor(node):
-    nodeMetrics = getNodeMetrics(APIPorts[node])
+    nodeMetrics = getNodeMetrics(node)
     nodeMetricsDict = {}
     for family in nodeMetrics:
         for sample in family.samples:
@@ -72,38 +51,14 @@ def getRelevantMetricsFor(node):
                 nodeMetricsDict[sample.name] = sample.value
     return nodeMetricsDict
 
-def getNodeAddresses():
-    for node, APIPort in APIPorts.items():
-        url = APIurlbase.substitute(APIport=APIPort) + 'account/addresses'
-        headers = {'accept': 'application/json',
-                   'x-auth-token': myApiAuthToken}
-    
-        response = HTTPgetRequest(url, headers)
-        responseJson = response.json()
-        nodeHOPRAddresses[node] = responseJson['hopr']
-    return nodeHOPRAddresses
-
-def sendMessage(senderNode, receiverNode, message, path, hops):
-    recipientAddress = nodeHOPRAddresses[receiverNode]
-
-    url = APIurlbase.substitute(APIport=APIPorts[senderNode]) + 'messages'
+def getNodeAddressFor(node):
+    url = APIurlbase.substitute(APIport=APIPorts[node]) + 'account/addresses'
     headers = {'accept': 'application/json',
-               'x-auth-token': myApiAuthToken,
-               'Content-Type': 'application/json'}
-    data = {'body': message,
-            'recipient': recipientAddress,
-            'path' : path,
-            'hops': hops}
-    response = HTTPpostRequest(url, headers, data)
-    time.sleep(0.25) #Leave time for catching
-    return response
-
-def init():
-    #wait = input('Start the docker cluster by with     docker run --rm -d -p 8545:8545 -p 13301-13305:13301-13305 -p 18081-18085:18081-18085 -p 19091-19095:19091-19095 -p 19501-19505:19501-19505 --name pluto_cluster gcr.io/hoprassociation/hopr-pluto:1.92.7  and Press Enter to start the tests./n')
-
-    nodeHOPRAddresses = getNodeAddresses()
-    print('Node HOPR addresses:')
-    printDict(nodeHOPRAddresses) #not necessary for final run
+               'x-auth-token': myApiAuthToken}
+    
+    response = HTTPgetRequest(url, headers)
+    responseJson = response.json()
+    return responseJson['hopr']
 
 def test_channelsForAllNodes():
     for node, APIPort in APIPorts.items():
@@ -119,48 +74,130 @@ def test_channelsForAllNodes():
         assert len(responseJson['outgoing']) == (len(APIPorts)-1), node + ' does not have an outgoing channel to every node'
 
 def test_pingNodes():
-    for node, APIPort in APIPorts.items():
-        for HOPRaddress in nodeHOPRAddresses.values():
-            if HOPRaddress == nodeHOPRAddresses[node]:
+    for pingerNode, pingerAPIPort in APIPorts.items():
+        for pingNode, pingAPIPort in APIPorts.items():
+            if pingerNode == pingNode:
                 continue
-            data = {'peerId': HOPRaddress}
-            url = APIurlbase.substitute(APIport=APIPort) + 'node/ping'
+            data = {'peerId': getNodeAddressFor(pingNode)}
+            url = APIurlbase.substitute(APIport=pingerAPIPort) + 'node/ping'
             headers = {'accept': 'application/json',
                     'x-auth-token': myApiAuthToken,
                     'Content-Type': 'application/json'}
             response = HTTPpostRequest(url, headers, data)
+            assert response.status_code == 200, 'Ping from ' + pingerNode + ' to ' + pingNode + ' was unsuccessful.'
 
-def test_1():
+async def sendMessage(senderNode, receiverNode, message, path, hops):
+    await asyncio.sleep(0.1) #Let time for WebsocketClient to connect
+    recipientAddress = getNodeAddressFor(receiverNode)
 
-    init()
+    url = APIurlbase.substitute(APIport=APIPorts[senderNode]) + 'messages'
+    headers = {'accept': 'application/json',
+               'x-auth-token': myApiAuthToken,
+               'Content-Type': 'application/json'}
+    data = {'body': message,
+            'recipient': recipientAddress,
+            'path' : path,
+            'hops': hops}
+    response = HTTPpostRequest(url, headers, data)
 
-    senderNode = 'node1'
-    receiverNode = 'node5'
-    message = "This is the message."
-    path = []
-    hops = 1
+    assert response.status_code == 202, "Message was not sent successfully"
+
+async def connectWebsocket(receiverNode):
+    print('ConnectWebsocket Started')
+    websocketAPIbaseurl = Template('ws://localhost:$APIport/api/v2/messages/websocket?apiToken=$AuthToken')
+    url = websocketAPIbaseurl.substitute(APIport=APIPorts[receiverNode], AuthToken=myApiAuthToken)
+    async with websockets.connect(url) as websocket:
+        message = await websocket.recv()
+        assert message, 'No message received at ' + receiverNode
+
+@pytest.mark.asyncio
+async def case_singlemessage(senderNode, receiverNode, message, hops, path=[]):
 
     senderMetricsBefore = getRelevantMetricsFor(senderNode)
     receiverMetricsBefore = getRelevantMetricsFor(receiverNode)
 
-    #sign message
+    # Relaycheck
+    if path:
+        pathNodes = path
+        path = [ getNodeAddressFor(path[0]), getNodeAddressFor(path[1]) ]
+        relay1MetricsBefore = getRelevantMetricsFor(pathNodes[0])
+        relay2MetricsBefore = getRelevantMetricsFor(pathNodes[1])
 
-    response = sendMessage(senderNode, receiverNode, message, path, hops)
+    #Websocket Client and Message
+    await asyncio.gather(
+        connectWebsocket(receiverNode),
+        sendMessage(senderNode, receiverNode, message, path, hops))
+    
+    senderMetricsAfter = getRelevantMetricsFor(senderNode)
+    receiverMetricsAfter = getRelevantMetricsFor(receiverNode)
+    assert senderMetricsBefore['core_counter_sent_messages_total'] == senderMetricsAfter['core_counter_sent_messages_total']-1 , 'Message was not sent'
+    assert receiverMetricsBefore['core_counter_received_messages_total'] == receiverMetricsAfter['core_counter_received_messages_total']-1 , 'Message was not received'
 
-    assert response.status_code == 202
+    # Relaycheck
+    if path:
+        relay1MetricsAfter = getRelevantMetricsFor(pathNodes[0])
+        relay2MetricsAfter = getRelevantMetricsFor(pathNodes[1])
+        assert relay1MetricsBefore['core_counter_forwarded_messages_total'] == relay1MetricsAfter['core_counter_forwarded_messages_total']-1 , 'Message was not relayed through ' + path[0]
+        assert relay2MetricsBefore['core_counter_forwarded_messages_total'] == relay2MetricsAfter['core_counter_forwarded_messages_total']-1 , 'Message was not relayed through ' + path[1]
 
+#not in use, just for limitation demonstration
+@pytest.mark.asyncio
+async def case_messageInTraffic(senderNode, receiverNode, message, hops, trafficNodes, path=[] ):
+
+    senderMetricsBefore = getRelevantMetricsFor(senderNode)
+    receiverMetricsBefore = getRelevantMetricsFor(receiverNode)
+
+    #With multiple asynchronous messages non of the messages were delivered - Limitation(see documentation for details)
+    await asyncio.gather(
+        connectWebsocket(receiverNode),
+        sendMessage(senderNode, receiverNode, message, path, hops),
+        sendMessage(trafficNodes[0], trafficNodes[1], 'covertraffic1', [], 3),
+        sendMessage(trafficNodes[0], trafficNodes[1], 'covertraffic1', [], 3),
+        sendMessage(trafficNodes[0], trafficNodes[1], 'covertraffic1', [], 3),
+        sendMessage(trafficNodes[0], trafficNodes[1], 'covertraffic1', [], 3),
+        sendMessage(trafficNodes[0], trafficNodes[1], 'covertraffic1', [], 3),
+        sendMessage(trafficNodes[0], trafficNodes[1], 'covertraffic1', [], 3)
+        )
+    await asyncio.sleep(0.2)
+    
     senderMetricsAfter = getRelevantMetricsFor(senderNode)
     receiverMetricsAfter = getRelevantMetricsFor(receiverNode)
 
-    #Send Check
-    assert senderMetricsBefore['core_counter_sent_messages_total'] == senderMetricsAfter['core_counter_sent_messages_total']-1 , 'Message was not sent'
-        #With response
+    assert senderMetricsBefore['core_counter_sent_messages_total'] == senderMetricsAfter['core_counter_sent_messages_total']-2 , 'Not all messages were not sent'
+    assert receiverMetricsBefore['core_counter_received_messages_total'] == receiverMetricsAfter['core_counter_received_messages_total']-2 , 'Not all messages were received'
 
-    assert receiverMetricsBefore['core_counter_received_messages_total'] == receiverMetricsAfter['core_counter_received_messages_total']-1 , 'Message was not received'
 
-    #Received Checker 2 - WebSocket
+def test_node1to5_1hop_notraffic():
+    senderNode = 'node1'
+    receiverNode = 'node5'
+    message = "This is the message."
+    hops = 1
 
-   
+    asyncio.run(case_singlemessage(senderNode, receiverNode, message, hops))
 
-    # Check tickets received for relaying - ???
+def test_node2to4_setpath_notraffic_relaycheck():
+    senderNode = 'node2'
+    receiverNode = 'node4'
+    message = "This is a test message." 
+    path = [ 'node1', 'node5']
+    hops = 2 #ignored if path is set
 
+    asyncio.run(case_singlemessage(senderNode, receiverNode, message, hops, path))
+
+def test_node3to1_3hops_nopath_notraffic():
+    senderNode = 'node3'
+    receiverNode = 'node1'
+    message = "This is the message."
+    hops = 3 
+
+    asyncio.run(case_singlemessage(senderNode, receiverNode, message, hops))
+
+#With multiple asynchronous messages non of the messages were delivered - Limitation(see documentation for details)
+""" def test_node1to5_3hops_nopath_heavytraffic():
+    senderNode = 'node1'
+    receiverNode = 'node5'
+    trafficNodes = ['node1', 'node2', 'node3']
+    message = "This is the message."
+    hops = 3 
+
+    asyncio.run(case_messageInTraffic(senderNode, receiverNode, message, hops, trafficNodes)) """
